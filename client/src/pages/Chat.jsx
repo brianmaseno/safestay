@@ -74,43 +74,51 @@ const Chat = () => {
       }
 
       socket.connect();
-      socket.emit('joinRoom', { 
-        username: user.name, 
-        roomId: user.apartmentName 
+      socket.emit('joinRoom', {
+        username: user.name,
+        roomId: "global" // Use global room
       });
 
       socket.on('userJoined', ({ user: joinedUser, roomId }) => {
         console.log('User joined:', joinedUser.name, 'in room:', roomId);
-        setOnlineUsers(prev => [...prev.filter(u => u.name !== joinedUser.name), joinedUser]);
+        setOnlineUsers(prev => [
+          ...prev.filter(u => u.name !== joinedUser.name),
+          joinedUser
+        ]);
       });
 
       socket.on('newMessage', (message) => {
         console.log('New message received:', message);
-        
-        // Only add message if it's not from the current user to avoid duplicates
-        if (message.senderId !== user._id && message.senderId._id !== user._id) {
+
+        // Only add message if it's not from the current user
+        if (message.senderId?._id !== user._id && message.senderId !== user._id) {
           setMessages(prev => {
+            // Check for duplicates using message ID, content, and timestamp
             const isDuplicate = prev.some(msg => 
               msg._id === message._id || 
               (msg.message === message.message && 
                msg.senderId === message.senderId && 
-               Math.abs(new Date(msg.createdAt) - new Date(message.createdAt)) < 1000)
+               Math.abs(new Date(msg.createdAt || msg.timestamp) - new Date(message.createdAt || message.timestamp)) < 1000)
             );
-            return isDuplicate ? prev : [...prev, message];
+            
+            if (isDuplicate) {
+              console.log('Duplicate message detected, skipping');
+              return prev;
+            }
+            
+            return [...prev, message];
           });
-        }
-        
-        // Update conversation list
-        setConversations(prev => prev.map(conv => 
-          conv.partnerId === message.senderId._id || conv.partnerId === message.receiverId._id
-            ? { ...conv, lastMessage: message }
-            : conv
-        ));
 
-        // Show notification if message is not from current user
-        if (message.senderId._id !== user._id) {
+          // Update conversation list
+          setConversations(prev => prev.map(conv =>
+            conv.partnerId === message.senderId._id || conv.partnerId === message.senderId
+              ? { ...conv, lastMessage: message }
+              : conv
+          ));
+
+          // Show notification
           if (Notification.permission === 'granted') {
-            new Notification(`New message from ${message.senderName}`, {
+            new Notification(`New message from ${message.senderName || message.senderId?.name}`, {
               body: message.message,
               icon: '/favicon.ico'
             });
@@ -123,6 +131,9 @@ const Chat = () => {
       });
 
       return () => {
+        socket.off('userJoined');
+        socket.off('newMessage');
+        socket.off('userOffline');
         socket.disconnect();
       };
     }
@@ -195,7 +206,11 @@ const Chat = () => {
       
       if (response.data && Array.isArray(response.data)) {
         console.log('💬 Loaded messages count:', response.data.length);
-        setMessages(response.data);
+        // Sort messages by timestamp to ensure proper chronological order
+        const sortedMessages = response.data.sort((a, b) => 
+          new Date(a.createdAt || a.timestamp) - new Date(b.createdAt || b.timestamp)
+        );
+        setMessages(sortedMessages);
       } else {
         console.log('💬 No messages found or invalid response');
         setMessages([]);
@@ -235,47 +250,55 @@ const Chat = () => {
     if (newMessage.trim() && selectedConversation && !sending) {
       setSending(true);
       setError('');
+      
+      const messageText = newMessage.trim();
+      setNewMessage(''); // Clear input immediately for better UX
+      
       try {
         const messageData = {
           receiverId: selectedConversation.partnerId,
-          message: newMessage.trim()
+          message: messageText
         };
 
         const response = await createChat(messageData);
         const newMessageObj = response.data.chat;
         
+        // Add sender name to the message object
+        const messageWithSender = {
+          ...newMessageObj,
+          senderName: user.name,
+          senderId: user._id
+        };
+        
+        // Add message to current conversation immediately (optimistic update)
+        setMessages(prev => [...prev, messageWithSender]);
+        
         // Send via socket for real-time updates to other users
+        // Only send to socket AFTER successful database save
         socket.emit('sendMessage', {
-          content: newMessage.trim(),
+          _id: newMessageObj._id, // Include message ID to prevent duplicates
+          content: messageText,
+          message: messageText, // Backend might expect 'message' field
           receiverName: selectedConversation.partnerName,
           senderName: user.name,
           senderId: user._id,
-          receiverId: selectedConversation.partnerId
-        });
-        
-        // Add message to current conversation (avoid duplicates)
-        setMessages(prev => {
-          const isDuplicate = prev.some(msg => 
-            msg._id === newMessageObj._id || 
-            (msg.message === newMessageObj.message && 
-             msg.senderId === newMessageObj.senderId && 
-             Math.abs(new Date(msg.createdAt) - new Date(newMessageObj.createdAt)) < 1000)
-          );
-          return isDuplicate ? prev : [...prev, newMessageObj];
+          receiverId: selectedConversation.partnerId,
+          createdAt: newMessageObj.createdAt,
+          timestamp: newMessageObj.createdAt
         });
         
         // Update conversation in the list
         const updatedConversations = conversations.map(conv => 
           conv.partnerId === selectedConversation.partnerId 
-            ? { ...conv, lastMessage: newMessageObj }
+            ? { ...conv, lastMessage: messageWithSender }
             : conv
         );
         setConversations(updatedConversations);
         
-        setNewMessage('');
       } catch (error) {
         console.error('Error sending message:', error);
         setError('Failed to send message. Please try again.');
+        setNewMessage(messageText); // Restore message text on error
       } finally {
         setSending(false);
       }
@@ -289,6 +312,23 @@ const Chat = () => {
     });
   };
 
+  const formatDate = (timestamp) => {
+    const date = new Date(timestamp);
+    const now = new Date();
+    const diffTime = Math.abs(now - date);
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+    
+    if (diffDays === 1) {
+      return 'Today';
+    } else if (diffDays === 2) {
+      return 'Yesterday';
+    } else if (diffDays <= 7) {
+      return `${diffDays - 1} days ago`;
+    } else {
+      return date.toLocaleDateString();
+    }
+  };
+
   // Function to start a new conversation
   const startNewConversation = async (userToMessage) => {
     try {
@@ -300,13 +340,24 @@ const Chat = () => {
       const response = await createChat(messageData);
       const newMessageObj = response.data.chat;
       
+      // Add sender name to the message object
+      const messageWithSender = {
+        ...newMessageObj,
+        senderName: user.name,
+        senderId: user._id
+      };
+      
       // Send via socket for real-time updates
       socket.emit('sendMessage', {
+        _id: newMessageObj._id,
         content: `Hello ${userToMessage.name}! 👋`,
+        message: `Hello ${userToMessage.name}! 👋`,
         receiverName: userToMessage.name,
         senderName: user.name,
         senderId: user._id,
-        receiverId: userToMessage._id
+        receiverId: userToMessage._id,
+        createdAt: newMessageObj.createdAt,
+        timestamp: newMessageObj.createdAt
       });
       
       // Create new conversation object
@@ -315,14 +366,14 @@ const Chat = () => {
         partnerName: userToMessage.name,
         partnerRole: userToMessage.role,
         partnerNationalID: userToMessage.nationalID,
-        lastMessage: newMessageObj,
+        lastMessage: messageWithSender,
         messageCount: 1
       };
 
       // Add to conversations and select it
       setConversations([newConversation, ...conversations]);
       setSelectedConversation(newConversation);
-      setMessages([newMessageObj]);
+      setMessages([messageWithSender]);
     } catch (error) {
       console.error('Error starting new conversation:', error);
       alert('Failed to start conversation. Please try again.');
@@ -531,15 +582,35 @@ const Chat = () => {
                 ) : (
                   messages.map((message, index) => {
                     const isCurrentUser = message.senderId?._id === user._id || message.senderId === user._id;
+                    const messageDate = new Date(message.createdAt || message.timestamp);
+                    const prevMessageDate = index > 0 ? new Date(messages[index - 1]?.createdAt || messages[index - 1]?.timestamp) : null;
+                    
+                    // Show date separator if it's a new day
+                    const showDateSeparator = index === 0 || 
+                      (prevMessageDate && messageDate.toDateString() !== prevMessageDate.toDateString());
+                    
+                    // Show timestamp if it's been more than 5 minutes since last message
                     const showTimestamp = index === 0 || 
-                      (new Date(message.createdAt || message.timestamp) - new Date(messages[index - 1]?.createdAt || messages[index - 1]?.timestamp)) > 300000; // 5 minutes
+                      (messageDate - prevMessageDate) > 300000; // 5 minutes
+                    
+                    // Get sender name
+                    const senderName = message.senderName || 
+                      (message.senderId?.name) || 
+                      (isCurrentUser ? user.name : selectedConversation.partnerName);
                     
                     return (
                       <div key={message._id || index}>
-                        {showTimestamp && (
+                        {showDateSeparator && (
                           <div className="text-center mb-4">
                             <span className="bg-white px-3 py-1 rounded-full text-xs text-gray-500 shadow-sm">
-                              {new Date(message.createdAt || message.timestamp).toLocaleString()}
+                              {formatDate(messageDate)}
+                            </span>
+                          </div>
+                        )}
+                        {showTimestamp && (
+                          <div className="text-center mb-2">
+                            <span className="bg-gray-200 px-2 py-1 rounded text-xs text-gray-600">
+                              {formatTime(messageDate)}
                             </span>
                           </div>
                         )}
@@ -549,11 +620,16 @@ const Chat = () => {
                               ? 'bg-green-500 text-white ml-12'
                               : 'bg-white text-gray-800 mr-12'
                           }`}>
+                            {!isCurrentUser && (
+                              <p className="text-xs font-medium mb-1 opacity-70">
+                                {senderName}
+                              </p>
+                            )}
                             <p className="text-sm leading-relaxed">{message.message}</p>
                             <p className={`text-xs mt-1 ${
                               isCurrentUser ? 'text-green-100' : 'text-gray-400'
                             }`}>
-                              {formatTime(message.createdAt || message.timestamp)}
+                              {formatTime(messageDate)}
                             </p>
                           </div>
                         </div>
@@ -607,6 +683,7 @@ const Chat = () => {
               </div>
             </>
           ) : (
+            /* Welcome Screen */
             /* Welcome Screen */
             <div className="flex-1 flex items-center justify-center bg-gray-50">
               <div className="text-center">
